@@ -22,6 +22,8 @@ import dataset.cifar10 as dataset
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
 from torch.utils.tensorboard import SummaryWriter
 
+from modules import interleave
+
 parser = argparse.ArgumentParser(description='PyTorch MixMatch Training')
 # Optimization options
 parser.add_argument('--epochs',
@@ -39,6 +41,11 @@ parser.add_argument('--batch-size',
                     type=int,
                     metavar='N',
                     help='train batchsize')
+parser.add_argument('--layers_mix',
+                    default=0,
+                    type=int,
+                    metavar='N',
+                    help='layers to mix. If -1, randomly mix in [0,1,2]')
 parser.add_argument('--lr',
                     '--learning-rate',
                     default=0.002,
@@ -76,6 +83,10 @@ parser.add_argument('--T', default=0.5, type=float)
 parser.add_argument('--ema-decay', default=0.999, type=float)
 
 args = parser.parse_args()
+if args.layers_mix == -1:
+    args.layers_mix = [0, 1]
+elif args.layers_mix == -2:
+    args.layers_mix = [0, 1, 2]
 state = {k: v for k, v in args._get_kwargs()}
 
 # Use CUDA
@@ -317,23 +328,30 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer,
         l = max(l, 1 - l)
 
         idx = torch.randperm(all_inputs.size(0))
-
-        input_a, input_b = all_inputs, all_inputs[idx]
         target_a, target_b = all_targets, all_targets[idx]
-
-        mixed_input = l * input_a + (1 - l) * input_b
         mixed_target = l * target_a + (1 - l) * target_b
+        """
+        # input_a, input_b = all_inputs, all_inputs[idx]
+        mixed_input = l * input_a + (1 - l) * input_b
 
-        # interleave labeled and unlabed samples between batches to get correct batchnorm calculation
+        interleave labeled and unlabed samples between batches to get correct batchnorm calculation
         mixed_input = list(torch.split(mixed_input, batch_size))
         mixed_input = interleave(mixed_input, batch_size)
 
         logits = [model(mixed_input[0])]
         for input in mixed_input[1:]:
             logits.append(model(input))
-
         # put interleaved samples back
         logits = interleave(logits, batch_size)
+        """
+
+        logits = model(all_inputs,
+                       mix=True,
+                       layers_mix=args.layers_mix,
+                       idx=idx,
+                       batch_size=args.batch_size,
+                       l=l)
+
         logits_x = logits[0]
         logits_u = torch.cat(logits[1:], dim=0)
 
@@ -484,26 +502,6 @@ class WeightEMA(object):
                 ema_param.add_(param * one_minus_alpha)
                 # customized weight decay
                 param.mul_(1 - self.wd)
-
-
-def interleave_offsets(batch, nu):
-    groups = [batch // (nu + 1)] * (nu + 1)
-    for x in range(batch - sum(groups)):
-        groups[-x - 1] += 1
-    offsets = [0]
-    for g in groups:
-        offsets.append(offsets[-1] + g)
-    assert offsets[-1] == batch
-    return offsets
-
-
-def interleave(xy, batch):
-    nu = len(xy) - 1
-    offsets = interleave_offsets(batch, nu)
-    xy = [[v[offsets[p]:offsets[p + 1]] for p in range(nu + 1)] for v in xy]
-    for i in range(1, nu + 1):
-        xy[0][i], xy[i][i] = xy[i][i], xy[0][i]
-    return [torch.cat(v, dim=0) for v in xy]
 
 
 if __name__ == '__main__':
