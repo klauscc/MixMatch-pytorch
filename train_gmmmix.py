@@ -23,6 +23,12 @@ from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
 from torch.utils.tensorboard import SummaryWriter
 
 from modules import interleave
+from models.gmm import SSLGaussMixture, generate_gaussian_means, compute_nll, compute_nll1
+from models.cnf import create_cnf_model, create_nf_model, create_cnf_model_1
+
+from train_misc import set_cnf_options, count_nfe, count_parameters, count_total_time
+from train_misc import add_spectral_norm, spectral_norm_power_iteration
+from train_misc import create_regularization_fns, get_regularization, append_regularization_to_log
 
 parser = argparse.ArgumentParser(description='PyTorch MixMatch Training')
 # Optimization options
@@ -33,11 +39,6 @@ parser.add_argument('--start-epoch',
                     metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('--batch-size', default=64, type=int, metavar='N', help='train batchsize')
-parser.add_argument('--layers_mix',
-                    default=0,
-                    type=int,
-                    metavar='N',
-                    help='layers to mix. If -1, randomly mix in [0,1,2]')
 parser.add_argument('--lr',
                     '--learning-rate',
                     default=0.002,
@@ -63,11 +64,73 @@ parser.add_argument('--lambda-u', default=75, type=float)
 parser.add_argument('--T', default=0.5, type=float)
 parser.add_argument('--ema-decay', default=0.999, type=float)
 
+# manifold mixup
+parser.add_argument('--layers_mix',
+                    default=0,
+                    type=int,
+                    metavar='N',
+                    help='layers to mix. If -1, randomly mix in [0,1,2]')
+
+#CNF
+parser.add_argument("--dims", type=str, default="64,64,64")
+parser.add_argument("--strides", type=str, default="1,1,1,1")
+parser.add_argument("--num_blocks", type=int, default=2, help='Number of stacked CNFs.')
+parser.add_argument("--conv", type=eval, default=True, choices=[True, False])
+parser.add_argument(
+    "--layer_type",
+    type=str,
+    default="concat",
+    choices=["ignore", "concat", "concat_v2", "squash", "concatsquash", "concatcoord", "hyper", "blend"])
+parser.add_argument("--divergence_fn",
+                    type=str,
+                    default="approximate",
+                    choices=["brute_force", "approximate"])
+parser.add_argument("--nonlinearity",
+                    type=str,
+                    default="softplus",
+                    choices=["tanh", "relu", "softplus", "elu", "swish"])
+SOLVERS = ["dopri5", "bdf", "rk4", "midpoint", 'adams', 'explicit_adams']
+
+parser.add_argument('--atol', type=float, default=1e-5)
+parser.add_argument('--rtol', type=float, default=1e-5)
+parser.add_argument('--solver', type=str, default='rk4', choices=SOLVERS)
+parser.add_argument("--step_size", type=float, default=0.04, help="Optional fixed step size.")
+
+parser.add_argument('--test_solver', type=str, default=None, choices=SOLVERS + [None])
+parser.add_argument('--test_atol', type=float, default=None)
+parser.add_argument('--test_rtol', type=float, default=None)
+
+parser.add_argument("--cnf_alpha", type=float, default=1e-6)
+parser.add_argument('--spectral_norm', type=eval, default=False, choices=[True, False])
+parser.add_argument("--spectral_norm_niter", type=int, default=10)
+parser.add_argument('--residual', type=eval, default=False, choices=[True, False])
+parser.add_argument("--batch_norm", type=eval, default=False, choices=[True, False])
+parser.add_argument('--rademacher', type=eval, default=True, choices=[True, False])
+parser.add_argument('--time_length', type=float, default=1.0)
+parser.add_argument('--train_T', type=eval, default=False)
+parser.add_argument('--multiscale', type=eval, default=True, choices=[True, False])
+parser.add_argument('--parallel', type=eval, default=False, choices=[True, False])
+parser.add_argument('--autoencode', type=eval, default=False, choices=[True, False])
+
+# Regularizations
+parser.add_argument('--l1int', type=float, default=0.02, help="int_t ||f||_1")
+parser.add_argument('--l2int', type=float, default=None, help="int_t ||f||_2")
+parser.add_argument('--dl2int', type=float, default=None, help="int_t ||f^T df/dt||_2")
+parser.add_argument('--JFrobint', type=float, default=None, help="int_t ||df/dx||_F")
+parser.add_argument('--JdiagFrobint', type=float, default=None, help="int_t ||df_i/dx_i||_F")
+parser.add_argument('--JoffdiagFrobint', type=float, default=None, help="int_t ||df/dx - df_i/dx_i||_F")
+
+parser.add_argument("--weight_decay", type=float, default=0.0)
+
+num_classes = 10
+
 args = parser.parse_args()
+
 if args.layers_mix == -1:
     args.layers_mix = [0, 1]
 elif args.layers_mix == -2:
     args.layers_mix = [0, 1, 2]
+
 state = {k: v for k, v in args._get_kwargs()}
 
 # Use CUDA
@@ -122,7 +185,7 @@ def main():
     print("==> creating WRN-28-2")
 
     def create_model(ema=False):
-        model = models.WideResNet(num_classes=10)
+        model = models.WideResNet(num_classes=num_classes)
         model = model.cuda()
 
         if ema:
@@ -131,8 +194,25 @@ def main():
 
         return model
 
+    data_shape = [3, 32, 32]
+
+    regularization_fns, regularization_coeffs = create_regularization_fns(args)
+
+    def create_cnf():
+        # generate cnf
+        # cnf = create_cnf_model_1(args, data_shape, regularization_fns=None)
+        # cnf = create_cnf_model(args, data_shape, regularization_fns=regularization_fns)
+        cnf = create_nf_model(args, data_shape, regularization_fns=None)
+        cnf = cnf.cuda() if use_cuda else cnf
+        return cnf
+
     model = create_model()
     ema_model = create_model(ema=True)
+    cnf = create_cnf()
+
+    if args.spectral_norm:
+        add_spectral_norm(cnf, logger)
+        set_cnf_options(args, cnf)
 
     cudnn.benchmark = True
     print('    Total params: %.2fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
@@ -141,10 +221,15 @@ def main():
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
+    #CNF
+    cnf_optimizer = optim.Adam(cnf.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
     ema_optimizer = WeightEMA(model, ema_model, alpha=args.ema_decay)
     start_epoch = 0
 
     # Resume
+    #generate prior
+    means = generate_gaussian_means(num_classes, data_shape, seed=num_classes)
     title = 'noisy-cifar-10'
     if args.resume:
         # Load checkpoint.
@@ -156,13 +241,21 @@ def main():
         start_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'])
         ema_model.load_state_dict(checkpoint['ema_state_dict'])
+        cnf.load_state_dict(checkpoint['cnf_state_dict'])
+        means = checkpoint['means']
+        cnf_optimizer.load_state_dict(checkpoint['cnf_optimizer'])
         optimizer.load_state_dict(checkpoint['optimizer'])
+
         logger = Logger(os.path.join(args.out, 'log.txt'), title=title, resume=True)
     else:
         logger = Logger(os.path.join(args.out, 'log.txt'), title=title)
         logger.set_names([
-            'Train Loss', 'Train Loss X', 'Train Loss U', 'Valid Loss', 'Valid Acc.', 'Test Loss', 'Test Acc.'
+            'Train Loss', 'Train Loss X', 'Train Loss U', 'Train loss NLL X', 'Train loss NLL U',
+            'Train loss mixed X', 'Valid Loss', 'Valid Acc.', 'Test Loss', 'Test Acc.'
         ])
+
+    means = means.cuda() if use_cuda else means
+    prior = SSLGaussMixture(means, device='cuda' if use_cuda else 'cpu')
 
     writer = SummaryWriter(args.out)
     step = 0
@@ -172,9 +265,9 @@ def main():
 
         print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
 
-        train_loss, train_loss_x, train_loss_u = train(labeled_trainloader, unlabeled_trainloader, model,
-                                                       optimizer, ema_optimizer, train_criterion, epoch,
-                                                       use_cuda)
+        train_loss, train_loss_x, train_loss_u, train_loss_nll_x, train_loss_nll_u, train_loss_mixed_x = train(
+            labeled_trainloader, unlabeled_trainloader, model, cnf, prior, cnf_optimizer, optimizer,
+            ema_optimizer, train_criterion, epoch, use_cuda)
         _, train_acc = validate(labeled_trainloader,
                                 ema_model,
                                 criterion,
@@ -187,6 +280,10 @@ def main():
         step = args.train_iteration * (epoch + 1)
 
         writer.add_scalar('losses/train_loss', train_loss, step)
+        writer.add_scalar('losses/train_loss_nll_x', train_loss_nll_x, step)
+        writer.add_scalar('losses/train_loss_nll_u', train_loss_nll_u, step)
+        writer.add_scalar('losses/train_loss_mixed_x', train_loss_mixed_x, step)
+        writer.add_scalar('losses/train_loss_nll_x', train_loss_nll_x, step)
         writer.add_scalar('losses/valid_loss', val_loss, step)
         writer.add_scalar('losses/test_loss', test_loss, step)
 
@@ -195,7 +292,10 @@ def main():
         writer.add_scalar('accuracy/test_acc', test_acc, step)
 
         # append logger file
-        logger.append([train_loss, train_loss_x, train_loss_u, val_loss, val_acc, test_loss, test_acc])
+        logger.append([
+            train_loss, train_loss_x, train_loss_u, train_loss_nll_x, train_loss_nll_u, train_loss_mixed_x,
+            val_loss, val_acc, test_loss, test_acc
+        ])
 
         # save model
         is_best = val_acc > best_acc
@@ -204,10 +304,13 @@ def main():
             {
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
+                'cnf_state_dict': cnf.state_dict(),
+                'means': means,
                 'ema_state_dict': ema_model.state_dict(),
                 'acc': val_acc,
                 'best_acc': best_acc,
                 'optimizer': optimizer.state_dict(),
+                'cnf_optimizer': cnf_optimizer.state_dict(),
             }, is_best)
         test_accs.append(test_acc)
     logger.close()
@@ -220,14 +323,18 @@ def main():
     print(np.mean(test_accs[-20:]))
 
 
-def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_optimizer, criterion, epoch,
-          use_cuda):
+def train(labeled_trainloader, unlabeled_trainloader, model, cnf, prior, cnf_optimizer, optimizer,
+          ema_optimizer, criterion, epoch, use_cuda):
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
     losses_x = AverageMeter()
     losses_u = AverageMeter()
+    losses_nll_x = AverageMeter()
+    losses_nll_u = AverageMeter()
+    losses_mixed_x = AverageMeter()
+
     ws = AverageMeter()
     end = time.time()
 
@@ -236,6 +343,7 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
     unlabeled_train_iter = iter(unlabeled_trainloader)
 
     model.train()
+    cnf.train()
     for batch_idx in range(args.train_iteration):
         try:
             inputs_x, targets_x = labeled_train_iter.next()
@@ -269,6 +377,7 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
             p = (torch.softmax(outputs_u, dim=1) + torch.softmax(outputs_u2, dim=1)) / 2
             pt = p**(1 / args.T)
             targets_u = pt / pt.sum(dim=1, keepdim=True)
+            # targets_u = torch.nn.functional.one_hot(torch.argmax(p, dim=1), num_classes=num_classes)
             targets_u = targets_u.detach()
 
         # mixup
@@ -276,12 +385,7 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
         all_targets = torch.cat([targets_x, targets_u, targets_u], dim=0)
 
         l = np.random.beta(args.alpha, args.alpha)
-
         l = max(l, 1 - l)
-
-        idx = torch.randperm(all_inputs.size(0))
-        target_a, target_b = all_targets, all_targets[idx]
-        mixed_target = l * target_a + (1 - l) * target_b
         """
         # input_a, input_b = all_inputs, all_inputs[idx]
         mixed_input = l * input_a + (1 - l) * input_b
@@ -298,30 +402,69 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
         """
 
         logits = model(all_inputs,
-                       mix=True,
+                       do_interleave=True,
+                       mix=False,
                        layers_mix=args.layers_mix,
-                       idx=idx,
+                       idx=None,
                        batch_size=args.batch_size,
                        l=l)
 
         logits_x = logits[0]
         logits_u = torch.cat(logits[1:], dim=0)
 
-        Lx, Lu, w = criterion(logits_x, mixed_target[:batch_size], logits_u, mixed_target[batch_size:],
+        Lx, Lu, w = criterion(logits_x, all_targets[:batch_size], logits_u, all_targets[batch_size:],
                               epoch + batch_idx / args.train_iteration)
 
-        loss = Lx + w * Lu
+        # GMM
+        # inputs_u_all = torch.cat([inputs_u, inputs_u2], dim=0)
+        # targets_u_all = torch.cat([targets_u, targets_u], dim=0)
+        inputs_u_all = inputs_u
+        targets_u_all = targets_u
+        # nll_x, nll_u, zx, zu = compute_nll(inputs_x, targets_x, inputs_u_all, targets_u_all, cnf, prior)
+        nll_x, nll_u, zx, zu = compute_nll1(inputs_x, targets_x, inputs_u_all, targets_u_all, cnf, prior)
+
+        # mixup in z-space
+        z_all = torch.cat([zx, zu], dim=0)
+        idx = torch.randperm(z_all.size(0))
+
+        with torch.no_grad():
+            za, zb = z_all, z_all[idx]
+            mixed_z = l * za + (1 - l) * zb
+            mixed_z = mixed_z[torch.randperm(mixed_z.size(0))][:batch_size]
+            # zeros = torch.zeros(mixed_z.shape[0], 1).to(mixed_z)
+            # mixed_x, delta_logp = cnf(mixed_z, zeros, reverse=True)
+            mixed_x = cnf.inverse(mixed_z)
+            target_mixed_x = prior.class_probs(mixed_z)
+
+        logits_mixed = model(mixed_x, do_interleave=True, batch_size=args.batch_size)
+        logits_mixed = torch.cat(logits_mixed, dim=0)
+        probs_mixed = torch.softmax(logits_mixed, dim=1)
+        Lu_mixed = torch.mean((probs_mixed - target_mixed_x)**2)
+
+        # loss = Lx + w * Lu + nll_x + w * nll_u + w * Lu_mixed
+        loss = Lx + w * Lu + 10 * Lu_mixed
+        cnf_loss = 1e-2 * (nll_x + min(w, 1.0) * nll_u)
+        # cnf_loss = w * (nll_x + nll_u)
 
         # record loss
         losses.update(loss.item(), inputs_x.size(0))
         losses_x.update(Lx.item(), inputs_x.size(0))
         losses_u.update(Lu.item(), inputs_x.size(0))
+        losses_nll_x.update(nll_x.item(), inputs_x.size(0))
+        losses_nll_u.update(nll_u.item(), inputs_x.size(0))
+        losses_mixed_x.update(Lu_mixed.item(), inputs_x.size(0))
         ws.update(w, inputs_x.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
+        cnf_optimizer.zero_grad()
+
         loss.backward()
+        cnf_loss.backward()
+        torch.nn.utils.clip_grad_norm_(cnf.parameters(), 100.0)
+
         optimizer.step()
+        cnf_optimizer.step()
         ema_optimizer.step()
 
         # measure elapsed time
@@ -329,7 +472,7 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
         end = time.time()
 
         # plot progress
-        bar.suffix = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | Loss_x: {loss_x:.4f} | Loss_u: {loss_u:.4f} | W: {w:.4f}'.format(
+        bar.suffix = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | Loss_x: {loss_x:.4f} | Loss_u: {loss_u:.4f}| loss_nll_x: {loss_nll_x: .4f} | loss_nll_u: {loss_nll_u:.4f}| loss_mixed_x: {loss_mixed_x: .4f} | W: {w:.4f}'.format(
             batch=batch_idx + 1,
             size=args.train_iteration,
             data=data_time.avg,
@@ -339,6 +482,9 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
             loss=losses.avg,
             loss_x=losses_x.avg,
             loss_u=losses_u.avg,
+            loss_nll_x=losses_nll_x.avg,
+            loss_nll_u=losses_nll_u.avg,
+            loss_mixed_x=losses_mixed_x.avg,
             w=ws.avg,
         )
         bar.next()
@@ -348,6 +494,9 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
         losses.avg,
         losses_x.avg,
         losses_u.avg,
+        losses_nll_x.avg,
+        losses_nll_u.avg,
+        losses_mixed_x.avg,
     )
 
 
@@ -420,10 +569,12 @@ def linear_rampup(current, rampup_length=args.epochs):
 class SemiLoss(object):
 
     def __call__(self, outputs_x, targets_x, outputs_u, targets_u, epoch):
-        probs_u = torch.softmax(outputs_u, dim=1)
 
         Lx = -torch.mean(torch.sum(F.log_softmax(outputs_x, dim=1) * targets_x, dim=1))
+
+        probs_u = torch.softmax(outputs_u, dim=1)
         Lu = torch.mean((probs_u - targets_u)**2)
+        # Lu = torch.nn.functional.cross_entropy(probs_u, targets_u)
 
         return Lx, Lu, args.lambda_u * linear_rampup(epoch)
 
