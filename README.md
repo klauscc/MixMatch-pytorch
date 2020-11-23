@@ -12,6 +12,9 @@ Now only experiments on CIFAR-10 are available.
 - matplotlib
 - numpy
 
+## requirements for CNF.
+- torchdiffeq
+
 ## Usage
 
 ### Manifold Mixup.
