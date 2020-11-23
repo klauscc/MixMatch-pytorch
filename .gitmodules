@@ -1,0 +1,6 @@
+[submodule "third_party/flowgmm"]
+	path = third_party/flowgmm
+	url = git@github.com:klauscc/flowgmm.git
+[submodule "third_party/ffjord"]
+	path = third_party/ffjord
+	url = git@github.com:rtqichen/ffjord.git
